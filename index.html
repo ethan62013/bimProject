@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IFC 查看</title>
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <div class="brand">IFC 查看</div>
+        <button id="openBtn" type="button">打开 IFC</button>
+        <button id="sampleBtn" type="button" class="ghost">打开示例</button>
+        <span id="fileName">未打开文件</span>
+        <span id="status"></span>
+        <input id="file" type="file" accept=".ifc,application/octet-stream" hidden />
+      </header>
+      <div id="workspace">
+        <aside id="panel">
+          <div class="panel-title">目录树</div>
+          <div class="search-row">
+            <input id="treeSearch" type="search" placeholder="搜索名称、编号或属性" />
+          </div>
+          <div id="tree" class="tree"></div>
+          <div class="pick">
+            <div class="panel-title">属性</div>
+            <div id="pickInfo">点击模型查看构件。</div>
+          </div>
+        </aside>
+        <main id="stage">
+          <canvas id="view"></canvas>
+          <div id="labels"></div>
+          <div id="empty">
+            <p>打开本地 .ifc 文件，或加载示例墙体。</p>
+            <p class="sub">左键旋转，右键平移，滚轮缩放。目录树可以按层、按类型或按构件隐藏。</p>
+          </div>
+          <div id="toolbar">
+            <div id="toolRow">
+              <button type="button" data-mode="orbit" class="active">查看</button>
+              <button type="button" data-mode="distance">距离</button>
+              <button type="button" data-mode="angle">角度</button>
+              <button type="button" data-mode="area">面积</button>
+              <button type="button" id="clearMeasure" class="ghost">清除测量</button>
+              <button type="button" id="fitBtn" class="ghost">适应视图</button>
+              <button type="button" id="sectionBtn" class="ghost">剖切</button>
+              <button type="button" id="isolateBtn" class="ghost">露出隔离</button>
+              <button type="button" id="storeyBtn" class="ghost">只看本层</button>
+              <button type="button" id="spaceBtn" class="ghost">显示空间</button>
+              <button type="button" id="hideMaterialBtn" class="ghost">隐藏材质</button>
+              <button type="button" id="showAllBtn" class="ghost">恢复显示</button>
+            </div>
+            <div id="sectionBar" hidden>
+              <button type="button" data-section="plane" class="active">面</button>
+              <button type="button" data-section="box">盒</button>
+              <div id="planeControls">
+                <span>剖切面</span>
+                <button type="button" data-axis="x">X</button>
+                <button type="button" data-axis="y" class="active">Y</button>
+                <button type="button" data-axis="z">Z</button>
+                <input id="sectionRange" type="range" min="0" max="1000" value="620" />
+                <button type="button" id="sectionFlip" class="ghost">反向</button>
+              </div>
+              <div id="boxControls" hidden>
+                <label class="box-axis"><span>X</span><input data-axis="x" data-edge="0" type="range" min="0" max="1000" value="80" /><input data-axis="x" data-edge="1" type="range" min="0" max="1000" value="920" /></label>
+                <label class="box-axis"><span>Y</span><input data-axis="y" data-edge="0" type="range" min="0" max="1000" value="0" /><input data-axis="y" data-edge="1" type="range" min="0" max="1000" value="620" /></label>
+                <label class="box-axis"><span>Z</span><input data-axis="z" data-edge="0" type="range" min="0" max="1000" value="80" /><input data-axis="z" data-edge="1" type="range" min="0" max="1000" value="920" /></label>
+              </div>
+            </div>
+          </div>
+          <div id="hint"></div>
+        </main>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
