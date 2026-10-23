@@ -106,6 +106,8 @@ const PREFIX_SCALE = {
   NANO: 1e-9
 }
 
+const WASM_MEMORY_LIMIT = 3 * 1024 * 1024 * 1024
+
 let apiPromise = null
 
 export function getIfcApi() {
@@ -120,18 +122,68 @@ export function getIfcApi() {
   return apiPromise
 }
 
+function resetIfcApi() {
+  apiPromise = null
+}
+
+function isWasmAbort(error) {
+  const message = String((error && error.message) || error || '')
+  return message.includes('Aborted') || message.includes('out of bounds')
+}
+
+function hookGeometryLogs(notes) {
+  const originalError = console.error
+  const originalWarn = console.warn
+  const originalLog = console.log
+  const take = (args) => {
+    const text = args.map((item) => {
+      if (typeof item === 'string') return item
+      if (item && item.message) return item.message
+      return ''
+    }).join(' ')
+    if (/No basis found for brep|TriangulateBounds/i.test(text)) notes.push(text)
+  }
+  console.error = (...args) => {
+    take(args)
+    originalError.apply(console, args)
+  }
+  console.warn = (...args) => {
+    take(args)
+    originalWarn.apply(console, args)
+  }
+  console.log = (...args) => {
+    take(args)
+    originalLog.apply(console, args)
+  }
+  return () => {
+    console.error = originalError
+    console.warn = originalWarn
+    console.log = originalLog
+  }
+}
+
+function abortMessage(geometryNotes) {
+  const failedFace = geometryNotes.some((text) => /No basis found for brep/i.test(text))
+  if (failedFace) return '有一个面片无法三角化，解析已中止。'
+  return '解析器在生成几何时中止了。模型可能超出了内存上限。'
+}
+
 export async function loadIfc(buffer, onProgress) {
   const api = await getIfcApi()
   if (onProgress) onProgress('正在解析 IFC…')
   await yieldToMain()
-  const modelID = api.OpenModel(new Uint8Array(buffer), {
-    COORDINATE_TO_ORIGIN: true,
-    CIRCLE_SEGMENTS: circleSegmentsFor(buffer.byteLength)
-  })
-  if (modelID < 0) throw new Error('无法打开这个 IFC 文件。')
+  let modelID = -1
   let library = null
   let model = null
+  const geometryNotes = []
+  const restoreLogs = hookGeometryLogs(geometryNotes)
   try {
+    modelID = api.OpenModel(new Uint8Array(buffer), {
+      COORDINATE_TO_ORIGIN: true,
+      CIRCLE_SEGMENTS: circleSegmentsFor(buffer.byteLength),
+      MEMORY_LIMIT: WASM_MEMORY_LIMIT
+    })
+    if (modelID < 0) throw new Error('无法打开这个 IFC 文件。')
     const unitScale = readLengthScale(api, modelID)
     library = createMaterialLibrary(api, modelID)
     if (onProgress) onProgress('正在整理目录…')
@@ -145,8 +197,21 @@ export async function loadIfc(buffer, onProgress) {
   } catch (error) {
     if (model) disposeModel(model)
     if (library) library.dispose()
-    api.CloseModel(modelID)
+    if (isWasmAbort(error)) {
+      resetIfcApi()
+      throw new Error(abortMessage(geometryNotes))
+    }
+    if (modelID >= 0) {
+      try {
+        api.CloseModel(modelID)
+      } catch (closeError) {
+        console.error(closeError)
+        if (isWasmAbort(closeError)) resetIfcApi()
+      }
+    }
     throw error
+  } finally {
+    restoreLogs()
   }
 }
 
@@ -162,7 +227,12 @@ export async function closeModel(session) {
   }
   disposeModel(session.model)
   if (session.library) session.library.dispose()
-  session.api.CloseModel(session.modelID)
+  try {
+    session.api.CloseModel(session.modelID)
+  } catch (error) {
+    console.error(error)
+    if (isWasmAbort(error)) resetIfcApi()
+  }
 }
 
 export function beginPropertyIndex(session, onProgress) {
@@ -189,8 +259,8 @@ function disposeModel(model) {
 }
 
 function circleSegmentsFor(byteLength) {
-  if (byteLength > 12 * 1024 * 1024) return 10
-  if (byteLength > 4 * 1024 * 1024) return 16
+  if (byteLength > 12 * 1024 * 1024) return 6
+  if (byteLength > 4 * 1024 * 1024) return 12
   if (byteLength > 1.5 * 1024 * 1024) return 24
   return 48
 }
@@ -653,7 +723,102 @@ function hiddenExpressIds(api, modelID) {
   const types = typeMap(api, modelID)
   const hidden = new Set()
   linesOf(api, modelID, types, 'IfcOpeningElement').forEach((id) => hidden.add(id))
+  linesOf(api, modelID, types, 'IfcOpeningStandardCase').forEach((id) => hidden.add(id))
   return hidden
+}
+
+function collectMeshIds(api, modelID, hidden, skipped) {
+  const ids = []
+  const seen = new Set()
+  api.GetAllTypesOfModel(modelID).forEach((item) => {
+    if (!api.IsIfcElement(item.typeID)) return
+    if (item.typeName === 'IfcOpeningElement' || item.typeName === 'IfcOpeningStandardCase') return
+    const lines = api.GetLineIDsWithType(modelID, item.typeID, false)
+    for (let i = 0; i < lines.size(); i += 1) {
+      const id = lines.get(i)
+      if (hidden.has(id) || skipped.has(id) || seen.has(id)) continue
+      seen.add(id)
+      ids.push(id)
+    }
+    if (typeof lines.delete === 'function') lines.delete()
+  })
+  return ids
+}
+
+async function faceSurfaceProductIds(api, modelID, onProgress) {
+  const types = typeMap(api, modelID)
+  const faceModels = new Set(linesOf(api, modelID, types, 'IfcFaceBasedSurfaceModel'))
+  if (!faceModels.size) return new Set()
+  if (onProgress) onProgress('正在检查曲面…')
+  await yieldToMain()
+  const badReps = new Set()
+  const shapeReps = linesOf(api, modelID, types, 'IfcShapeRepresentation')
+  for (let i = 0; i < shapeReps.length; i += 1) {
+    const id = shapeReps[i]
+    try {
+      const raw = api.GetRawLineData(modelID, id)
+      if (rawRefs(raw.arguments[3]).some((item) => faceModels.has(item))) badReps.add(id)
+    } catch (error) {
+      console.error(error)
+    }
+    if (i % 400 === 399) await yieldToMain()
+  }
+  const badMaps = new Set()
+  linesOf(api, modelID, types, 'IfcRepresentationMap').forEach((id) => {
+    try {
+      const raw = api.GetRawLineData(modelID, id)
+      if (badReps.has(rawRef(raw.arguments[1]))) badMaps.add(id)
+    } catch (error) {
+      console.error(error)
+    }
+  })
+  const badItems = new Set()
+  linesOf(api, modelID, types, 'IfcMappedItem').forEach((id) => {
+    try {
+      const raw = api.GetRawLineData(modelID, id)
+      if (badMaps.has(rawRef(raw.arguments[0]))) badItems.add(id)
+    } catch (error) {
+      console.error(error)
+    }
+  })
+  if (badItems.size) {
+    shapeReps.forEach((id) => {
+      if (badReps.has(id)) return
+      try {
+        const raw = api.GetRawLineData(modelID, id)
+        if (rawRefs(raw.arguments[3]).some((item) => badItems.has(item))) badReps.add(id)
+      } catch (error) {
+        console.error(error)
+      }
+    })
+  }
+  const badShapes = new Set()
+  linesOf(api, modelID, types, 'IfcProductDefinitionShape').forEach((id) => {
+    try {
+      const raw = api.GetRawLineData(modelID, id)
+      if (rawRefs(raw.arguments[2]).some((rep) => badReps.has(rep))) badShapes.add(id)
+    } catch (error) {
+      console.error(error)
+    }
+  })
+  if (!badShapes.size) return new Set()
+  const products = new Set()
+  const elementTypes = api.GetAllTypesOfModel(modelID).filter((item) => api.IsIfcElement(item.typeID))
+  for (let typeIndex = 0; typeIndex < elementTypes.length; typeIndex += 1) {
+    const lines = api.GetLineIDsWithType(modelID, elementTypes[typeIndex].typeID, false)
+    for (let i = 0; i < lines.size(); i += 1) {
+      const id = lines.get(i)
+      try {
+        const raw = api.GetRawLineData(modelID, id)
+        if (badShapes.has(rawRef(raw.arguments[6]))) products.add(id)
+      } catch (error) {
+        console.error(error)
+      }
+      if (i % 400 === 399) await yieldToMain()
+    }
+    if (typeof lines.delete === 'function') lines.delete()
+  }
+  return products
 }
 
 const BATCH_GEOMETRY_LIMIT = 4096
@@ -668,8 +833,13 @@ async function buildMeshes(api, modelID, unitScale, library, byteLength, onProgr
   const buckets = new Map()
   const hidden = hiddenExpressIds(api, modelID)
   const spaceIds = new Set(linesOf(api, modelID, typeMap(api, modelID), 'IfcSpace'))
-  const meshes = api.LoadAllGeometry(modelID)
-  const total = meshes.size()
+  const skippedSurfaces = await faceSurfaceProductIds(api, modelID, onProgress)
+  const meshIds = collectMeshIds(api, modelID, hidden, skippedSurfaces)
+  if (skippedSurfaces.size && onProgress) {
+    onProgress(`已跳过 ${skippedSurfaces.size} 个无法三角化的曲面`)
+    await yieldToMain()
+  }
+  const total = meshIds.length
   const heavy = byteLength > 4 * 1024 * 1024 || total > 1500
 
   function consumeFlat(flat) {
@@ -711,12 +881,47 @@ async function buildMeshes(api, modelID, unitScale, library, byteLength, onProgr
     })
   }
 
-  for (let i = 0; i < total; i += 1) {
-    const flat = meshes.get(i)
-    consumeFlat(flat)
-    if (typeof flat.delete === 'function') flat.delete()
-    if (heavy && i % 80 === 79) {
-      if (onProgress) onProgress(`正在生成几何 ${i + 1}/${total}`)
+  const batches = []
+  const chunkSize = heavy ? 40 : 200
+  const releaseGeometries = () => {
+    const flushed = flushChunks(group, buckets)
+    batches.push(...flushed)
+    buckets.clear()
+    geometryCache.forEach((geometry) => {
+      if (geometry) geometry.dispose()
+    })
+    geometryCache.clear()
+  }
+  for (let start = 0; start < meshIds.length; start += chunkSize) {
+    const slice = meshIds.slice(start, start + chunkSize)
+    try {
+      api.StreamMeshes(modelID, slice, (flat) => {
+        try {
+          consumeFlat(flat)
+        } finally {
+          if (typeof flat.delete === 'function') flat.delete()
+        }
+      })
+    } catch (error) {
+      if (isWasmAbort(error)) throw error
+      slice.forEach((id) => {
+        if (byId.has(id)) return
+        try {
+          const flat = api.GetFlatMesh(modelID, id)
+          try {
+            consumeFlat(flat)
+          } finally {
+            if (typeof flat.delete === 'function') flat.delete()
+          }
+        } catch (itemError) {
+          if (isWasmAbort(itemError)) throw itemError
+          console.error(itemError)
+        }
+      })
+    }
+    if (heavy) releaseGeometries()
+    if (heavy) {
+      if (onProgress) onProgress(`正在生成几何 ${Math.min(start + chunkSize, meshIds.length)}/${meshIds.length}`)
       await yieldToMain()
     }
   }
@@ -724,18 +929,22 @@ async function buildMeshes(api, modelID, unitScale, library, byteLength, onProgr
   for (let i = 0; i < missingSpaces.length; i += 1) {
     try {
       const flat = api.GetFlatMesh(modelID, missingSpaces[i])
-      consumeFlat(flat)
-      if (typeof flat.delete === 'function') flat.delete()
+      try {
+        consumeFlat(flat)
+      } finally {
+        if (typeof flat.delete === 'function') flat.delete()
+      }
     } catch (error) {
+      if (isWasmAbort(error)) throw error
       console.error(error)
     }
-    if (heavy && i % 40 === 39) await yieldToMain()
+    if (heavy && i % 40 === 39) {
+      releaseGeometries()
+      await yieldToMain()
+    }
   }
 
-  const batches = flushChunks(group, buckets)
-  geometryCache.forEach((geometry) => {
-    if (geometry) geometry.dispose()
-  })
+  releaseGeometries()
   byId.forEach((record) => {
     record.passThrough = record.parts.every((part) => part.passThrough)
     if (!record.passThrough && !record.space) return
@@ -762,7 +971,7 @@ async function buildMeshes(api, modelID, unitScale, library, byteLength, onProgr
     group.position.sub(center)
     group.updateMatrixWorld(true)
   }
-  return { group, byId, ids: new Set(byId.keys()), batches, extras }
+  return { group, byId, ids: new Set(byId.keys()), batches, extras, skippedSurfaces: skippedSurfaces.size }
 }
 
 function addAlignments(api, modelID, group, extras) {

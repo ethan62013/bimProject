@@ -223,13 +223,17 @@ async function openBuffer(bufferPromise, name) {
     empty.classList.add('hidden')
     fileName.textContent = name
     const count = session.model.ids.size
-    setStatus(`已加载 ${count} 个几何构件`)
+    const skipped = session.model.skippedSurfaces || 0
+    const loaded = skipped
+      ? `已加载 ${count} 个几何构件，跳过 ${skipped} 个无法三角化的曲面`
+      : `已加载 ${count} 个几何构件`
+    setStatus(loaded)
     pickInfo.textContent = '点击模型查看构件。'
     hint.textContent = ''
     const opened = next
     beginPropertyIndex(opened, () => {}).then(() => {
       if (session !== opened) return
-      setStatus(`已加载 ${count} 个几何构件`)
+      setStatus(loaded)
       if (selectedIds.length === 1) showPick(selectedIds[0])
     })
   } catch (error) {
